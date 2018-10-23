@@ -7,9 +7,10 @@ import tensorflow as tf
 
 from tensorpack.tfutils import argscope
 from tensorpack.tfutils.scope_utils import auto_reuse_variable_scope
+from tensorpack.tfutils.argscope import argscope, get_arg_scope
 from tensorpack.tfutils.varreplace import custom_getter_scope, freeze_variables
 from tensorpack.models import (
-    Conv2D, MaxPooling, BatchNorm, layer_register)
+    Conv2D, MaxPooling, GlobalAvgPooling, BatchNorm, layer_register, FullyConnected, BNReLU)
 
 from config import config as cfg
 
@@ -148,6 +149,51 @@ def resnet_bottleneck(l, ch_out, stride):
     ret = l + resnet_shortcut(shortcut, ch_out * 4, stride, activation=get_norm(zero_init=False))
     return tf.nn.relu(ret, name='output')
 
+def get_bn(zero_init=False):
+    """
+    Zero init gamma is good for resnet. See https://arxiv.org/abs/1706.02677.
+    """
+    if zero_init:
+        return lambda x, name=None: BatchNorm('bn', x, gamma_initializer=tf.zeros_initializer())
+    else:
+        return lambda x, name=None: BatchNorm('bn', x)
+
+############################################
+def se_resnet_bottleneck(l, ch_out, stride):
+    shortcut = l
+    if cfg.BACKBONE.STRIDE_1X1:
+        if stride == 2:
+            l = l[:, :, :-1, :-1]
+        l = Conv2D('conv1', l, ch_out, 1, strides=stride)
+        l = Conv2D('conv2', l, ch_out, 3, strides=1)
+    else:
+        l = Conv2D('conv1', l, ch_out, 1, strides=1)
+        if stride == 2:
+            l = tf.pad(l, [[0, 0], [0, 0], maybe_reverse_pad(0, 1), maybe_reverse_pad(0, 1)])
+            l = Conv2D('conv2', l, ch_out, 3, strides=2, padding='VALID')
+        else:
+            l = Conv2D('conv2', l, ch_out, 3, strides=stride)
+    l = Conv2D('conv3', l, ch_out * 4, 1, activation=get_norm(zero_init=True))
+
+    ################
+    print('ch_out', ch_out, '=============================')
+    print('l', l, '==============================')
+    squeeze = GlobalAvgPooling('gap', l, data_format='channels_first')
+    print('squeeze', squeeze, '========================')
+    squeeze = FullyConnected('fc1', squeeze, ch_out // 4, activation=tf.nn.relu)
+    squeeze = FullyConnected('fc2', squeeze, ch_out * 4, activation=tf.nn.sigmoid)
+    data_format = get_arg_scope()['Conv2D']['data_format']
+    ch_ax = 1 if data_format in ['NCHW', 'channels_first'] else 3
+    shape = [-1, 1, 1, 1]
+    shape[ch_ax] = ch_out * 4
+    l = l * tf.reshape(squeeze, shape)
+    ###############
+
+    ret = l + resnet_shortcut(shortcut, ch_out * 4, stride, activation=get_norm(zero_init=False))
+    return tf.nn.relu(ret, name='output')
+
+
+############################################
 
 def resnet_group(name, l, block_func, features, count, stride):
     with tf.variable_scope(name):
@@ -157,7 +203,7 @@ def resnet_group(name, l, block_func, features, count, stride):
     return l
 
 
-def resnet_c4_backbone(image, num_blocks):
+def resnet_c4_backbone(image, num_blocks, bottleneck='resnet'):
     assert len(num_blocks) == 3
     freeze_at = cfg.BACKBONE.FREEZE_AT
     with backbone_scope(freeze=freeze_at > 0):
@@ -166,23 +212,28 @@ def resnet_c4_backbone(image, num_blocks):
         l = tf.pad(l, [[0, 0], [0, 0], maybe_reverse_pad(0, 1), maybe_reverse_pad(0, 1)])
         l = MaxPooling('pool0', l, 3, strides=2, padding='VALID')
 
+    bottleneck_net = {'resnet': resnet_bottleneck, 'se': se_resnet_bottleneck}[bottleneck]
+
     with backbone_scope(freeze=freeze_at > 1):
-        c2 = resnet_group('group0', l, resnet_bottleneck, 64, num_blocks[0], 1)
+        c2 = resnet_group('group0', l, bottleneck_net, 64, num_blocks[0], 1)
     with backbone_scope(freeze=False):
-        c3 = resnet_group('group1', c2, resnet_bottleneck, 128, num_blocks[1], 2)
-        c4 = resnet_group('group2', c3, resnet_bottleneck, 256, num_blocks[2], 2)
+        c3 = resnet_group('group1', c2, bottleneck_net, 128, num_blocks[1], 2)
+        c4 = resnet_group('group2', c3, bottleneck_net, 256, num_blocks[2], 2)
     # 16x downsampling up to now
     return c4
 
 
 @auto_reuse_variable_scope
-def resnet_conv5(image, num_block):
+def resnet_conv5(image, num_block, bottleneck='resnet'):
+    bottleneck_net = {'resnet': resnet_bottleneck, 'se': se_resnet_bottleneck}[bottleneck]
+
     with backbone_scope(freeze=False):
-        l = resnet_group('group3', image, resnet_bottleneck, 512, num_block, 2)
+        l = resnet_group('group3', image, bottleneck_net, 512, num_block, 2)
         return l
 
 
-def resnet_fpn_backbone(image, num_blocks):
+# bottleneck : resnet, se
+def resnet_fpn_backbone(image, num_blocks, bottleneck='resnet'):
     freeze_at = cfg.BACKBONE.FREEZE_AT
     shape2d = tf.shape(image)[2:]
     mult = float(cfg.FPN.RESOLUTION_REQUIREMENT)
@@ -191,6 +242,7 @@ def resnet_fpn_backbone(image, num_blocks):
     assert len(num_blocks) == 4, num_blocks
     with backbone_scope(freeze=freeze_at > 0):
         chan = image.shape[1]
+        # print('CHAN!', chan, '=======================')
         pad_base = maybe_reverse_pad(2, 3)
         l = tf.pad(image, tf.stack(
             [[0, 0], [0, 0],
@@ -200,12 +252,15 @@ def resnet_fpn_backbone(image, num_blocks):
         l = Conv2D('conv0', l, 64, 7, strides=2, padding='VALID')
         l = tf.pad(l, [[0, 0], [0, 0], maybe_reverse_pad(0, 1), maybe_reverse_pad(0, 1)])
         l = MaxPooling('pool0', l, 3, strides=2, padding='VALID')
+
+    bottleneck_net = {'resnet':resnet_bottleneck, 'se':se_resnet_bottleneck}[bottleneck]
+
     with backbone_scope(freeze=freeze_at > 1):
-        c2 = resnet_group('group0', l, resnet_bottleneck, 64, num_blocks[0], 1)
+        c2 = resnet_group('group0', l, bottleneck_net, 64, num_blocks[0], 1)
     with backbone_scope(freeze=False):
-        c3 = resnet_group('group1', c2, resnet_bottleneck, 128, num_blocks[1], 2)
-        c4 = resnet_group('group2', c3, resnet_bottleneck, 256, num_blocks[2], 2)
-        c5 = resnet_group('group3', c4, resnet_bottleneck, 512, num_blocks[3], 2)
+        c3 = resnet_group('group1', c2, bottleneck_net, 128, num_blocks[1], 2)
+        c4 = resnet_group('group2', c3, bottleneck_net, 256, num_blocks[2], 2)
+        c5 = resnet_group('group3', c4, bottleneck_net, 512, num_blocks[3], 2)
     # 32x downsampling up to now
     # size of c5: ceil(input/32)
     return c2, c3, c4, c5
